@@ -10,6 +10,8 @@ from typing import BinaryIO, cast
 
 from config.constants.terminal_host import DEFERRED_OUTPUT_CHUNK_CHARS
 
+_BLOCK_RECORD = 1 << 31
+
 
 @contextmanager
 def _temporary_output_file() -> Iterator[BinaryIO]:
@@ -24,21 +26,26 @@ class DeferredOutput:
         self._resources = ExitStack()
         self._file = self._resources.enter_context(_temporary_output_file())
 
-    def write(self, text: str) -> None:
-        """Append independent UTF-8 records without retaining the caller's text."""
+    def write(self, text: str, *, block: bool = False) -> None:
+        """Append bounded UTF-8 records, marking only a block's first fragment."""
+        if block and not text:
+            self._write_record(b"", block=True)
         for start in range(0, len(text), DEFERRED_OUTPUT_CHUNK_CHARS):
             payload = text[start : start + DEFERRED_OUTPUT_CHUNK_CHARS].encode(
                 "utf-8", errors="surrogatepass"
             )
-            position = self._file.tell()
-            try:
-                self._write_all(struct.pack("!I", len(payload)))
-                self._write_all(payload)
-            except OSError:
-                # A failed record was never accepted; retain the valid prefix.
-                self._file.seek(position)
-                self._file.truncate()
-                raise
+            self._write_record(payload, block=block and start == 0)
+
+    def _write_record(self, payload: bytes, *, block: bool) -> None:
+        position = self._file.tell()
+        try:
+            self._write_all(struct.pack("!I", len(payload) | (_BLOCK_RECORD if block else 0)))
+            self._write_all(payload)
+        except OSError:
+            # A failed record was never accepted; retain the valid prefix.
+            self._file.seek(position)
+            self._file.truncate()
+            raise
 
     def _write_all(self, payload: bytes) -> None:
         remaining = memoryview(payload)
@@ -48,18 +55,19 @@ class DeferredOutput:
                 raise OSError("Deferred output write made no progress")
             remaining = remaining[written:]
 
-    def __iter__(self) -> Iterator[str]:
+    def __iter__(self) -> Iterator[tuple[bool, str]]:
         self._file.seek(0)
         while header := self._file.read(4):
             if len(header) != 4:
                 raise OSError("Invalid deferred output record")
-            size = struct.unpack("!I", header)[0]
+            framed_size = struct.unpack("!I", header)[0]
+            size = framed_size & ~_BLOCK_RECORD
             if size > DEFERRED_OUTPUT_CHUNK_CHARS * 4:
                 raise OSError("Oversized deferred output record")
             payload = self._file.read(size)
             if len(payload) != size:
                 raise OSError("Incomplete deferred output record")
-            yield payload.decode("utf-8", errors="surrogatepass")
+            yield bool(framed_size & _BLOCK_RECORD), payload.decode("utf-8", errors="surrogatepass")
 
     def close(self) -> None:
         """Release the anonymous temporary file on every completion path."""

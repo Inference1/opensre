@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import gc
 import hashlib
 import io
@@ -10,7 +11,7 @@ import tracemalloc
 import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 
 import pytest
 from prompt_toolkit.application import Application, create_app_session
@@ -20,6 +21,7 @@ from prompt_toolkit.output.base import Size
 from rich.text import Text
 
 import surfaces.interactive_shell.ui.input_prompt.deferred_output as deferred
+import surfaces.interactive_shell.ui.input_prompt.stdout as stdout_module
 from surfaces.interactive_shell.ui.input_prompt.stdout import _AppBoundStdoutProxy
 from surfaces.interactive_shell.ui.transcript_view import TranscriptStore
 
@@ -53,6 +55,20 @@ class _Alert:
 
     def __rich__(self) -> Text:
         return Text(self.text)
+
+
+class _ActiveApp:
+    is_running = True
+
+    def __init__(self, tasks: list[asyncio.Task[None]]) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.context = contextvars.copy_context()
+        self.tasks = tasks
+
+    def create_background_task(self, coroutine: Any) -> asyncio.Task[None]:
+        task = asyncio.create_task(coroutine)
+        self.tasks.append(task)
+        return task
 
 
 @contextmanager
@@ -176,7 +192,7 @@ def test_partial_disk_write_preserves_the_previously_accepted_records(
         monkeypatch.setattr(captured._file, "write", failing_write)
         with pytest.raises(OSError, match="disk full"):
             captured.write("unaccepted output")
-        assert list(captured) == ["accepted alert\n"]
+        assert list(captured) == [(False, "accepted alert\n")]
     finally:
         captured.close()
 
@@ -304,3 +320,66 @@ def test_partial_lines_keep_the_style_active_at_their_start(
             proxy.write(chunk)
     rows, _older = store.tail_rows(80, 20)
     assert ["".join(text for style, text in row if "red" in style) for row in rows] == red_rows
+
+
+def test_rich_alert_starts_a_block_after_an_unfinished_text_line() -> None:
+    store = TranscriptStore()
+    with _proxy(store) as (proxy, _output), proxy.defer_output():
+        proxy.write("partial")
+        proxy.write_renderable(Text("alert"))
+    rows, _older = store.tail_rows(80, 20)
+    assert ["".join(text for _style, text in row) for row in rows] == ["partial", "alert"]
+
+
+@pytest.mark.asyncio
+async def test_busy_terminal_replay_does_not_queue_the_entire_disk_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def slow_terminal(function: Any, *, in_executor: bool) -> None:
+        entered.set()
+        await release.wait()
+        function()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", slow_terminal)
+    with _proxy() as (proxy, output):
+        output.retain_text = False
+        proxy._target_app = cast(Application[str], _ActiveApp(tasks))
+        with proxy.defer_output():
+            proxy.write("x" * (4 * 1024 * 1024))
+        tracemalloc.start()
+        try:
+            proxy.close()
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            await asyncio.sleep(0)
+            retained, _peak = tracemalloc.get_traced_memory()
+            assert retained < 2 * 1024 * 1024
+        finally:
+            tracemalloc.stop()
+            release.set()
+            await asyncio.gather(*tasks)
+    assert output.bytes_written == 4 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_async_replay_reports_disk_failure_to_the_application_task(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    tasks: list[asyncio.Task[None]] = []
+
+    def failing_read(_self: deferred.DeferredOutput) -> Iterator[tuple[bool, str]]:
+        raise OSError("disk read failed")
+
+    monkeypatch.setattr(deferred.DeferredOutput, "__iter__", failing_read)
+    with _proxy() as (proxy, _output):
+        proxy._target_app = cast(Application[str], _ActiveApp(tasks))
+        with proxy.defer_output():
+            proxy.write("alert\n")
+        proxy.close()
+        await asyncio.sleep(0)
+        with pytest.raises(OSError, match="disk read failed"):
+            await tasks[0]
+    assert spool_files and all(handle.closed for handle in spool_files)

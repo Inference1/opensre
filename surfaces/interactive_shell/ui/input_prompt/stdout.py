@@ -8,6 +8,7 @@ import re
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import partial
 from typing import TextIO, cast
 
 from prompt_toolkit.application import Application, run_in_terminal
@@ -85,7 +86,7 @@ class _AppBoundStdoutProxy(StdoutProxy):
                 # Snapshot only deferred renderables so the aggregate backlog
                 # never retains live objects; normal output still reflows.
                 self._deferred_output.write(
-                    render_text(renderable, self._output.get_size().columns)
+                    render_text(renderable, self._output.get_size().columns), block=True
                 )
             else:
                 key = next(self._renderable_ids)
@@ -191,9 +192,20 @@ class _AppBoundStdoutProxy(StdoutProxy):
 
     def _replay_deferred_output(self, loop: asyncio.AbstractEventLoop | None, key: int) -> None:
         captured = self._deferred_files.pop(key)
+        if loop is not None and loop.is_running() and self._transcript is None:
+            self._schedule_terminal_replay(loop, captured)
+            return
         try:
             transcript = ReplayTranscript()
-            for text in captured:
+            for starts_block, text in captured:
+                if starts_block:
+                    if final := transcript.finish():
+                        self._emit_text(loop, "", final)
+                    if self._transcript is not None:
+                        self._transcript.close_pending_line()
+                    if loop is None or self._transient:
+                        self._write_to_terminal(loop, "\r")
+                    transcript = ReplayTranscript()
                 self._emit_text(loop, text, transcript.feed(text))
             if final := transcript.finish():
                 self._emit_text(loop, "", final)
@@ -204,6 +216,47 @@ class _AppBoundStdoutProxy(StdoutProxy):
                 captured.close()
             except OSError as exc:
                 self._flush_error = exc
+
+    def _schedule_terminal_replay(
+        self, loop: asyncio.AbstractEventLoop, captured: DeferredOutput
+    ) -> None:
+        async def replay() -> None:
+            try:
+                # One task owns the disk stream. Read the next record only after
+                # this one has reached the terminal, retaining no task backlog.
+                async with self._redraw_lock:
+                    for starts_block, text in captured:
+                        output = "\r" + text if starts_block else text
+                        if self._target_app.context is None or not self._target_app.is_running:
+                            self._write_to_terminal(None, output)
+                            await asyncio.sleep(0)
+                        else:
+                            with synchronized_output(self._output):
+                                await run_in_terminal(
+                                    partial(self._write_to_terminal, None, output),
+                                    in_executor=False,
+                                )
+            except asyncio.CancelledError:
+                self._flush_error = OSError("Deferred terminal replay was cancelled")
+                raise
+            except Exception as exc:
+                self._flush_error = exc
+                raise
+            finally:
+                captured.close()
+
+        def start() -> None:
+            context = self._target_app.context
+            if context is not None and self._target_app.is_running:
+                context.copy().run(self._target_app.create_background_task, replay())
+            else:
+                asyncio.create_task(replay())
+
+        try:
+            loop.call_soon_threadsafe(start)
+        except RuntimeError as exc:
+            self._flush_error = exc
+            captured.close()
 
     def _emit_text(
         self, loop: asyncio.AbstractEventLoop | None, text: str, transcript_text: str | None = None
