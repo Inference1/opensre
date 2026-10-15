@@ -39,6 +39,7 @@ _CRONTAB_LAST_WEEKDAY = 7
 _CRONTAB_WEEKDAY_ITEM = re.compile(
     r"(?:(?P<every>\*)|(?P<first>\d+)(?:-(?P<last>\d+))?)(?:/(?P<step>\d+))?"
 )
+_NAMED_WEEKDAY_RANGE_STEP = re.compile(r"(?P<first>[a-z]{3})-(?P<last>[a-z]{3})/(?P<step>.*)")
 
 
 def day_of_week_names(field: str) -> str:
@@ -46,14 +47,22 @@ def day_of_week_names(field: str) -> str:
 
     Numeric items (``0``, ``1-5``, ``1-5/2``, ``*/2``) are read the crontab way
     and become names; a step is expanded into a list, because APScheduler
-    ignores a step written after a name range. Names and a bare ``*`` mean the
-    same to both and pass through. Raises ``ValueError`` for a number above 7,
-    a backwards range, or a zero step.
+    ignores a step written after a name range. Named ranges with a step are
+    expanded the same way; other names and a bare ``*`` pass through.
+    Raises ``ValueError`` for a number above 7, a backwards range, or an invalid step.
     """
     passthrough: list[str] = []
     days: set[int] = set()
     for item in field.lower().split(","):
-        match = _CRONTAB_WEEKDAY_ITEM.fullmatch(item)
+        numeric_item = item
+        named_range = _NAMED_WEEKDAY_RANGE_STEP.fullmatch(item)
+        if named_range is not None:
+            first = _WEEKDAY_NAMES.index(named_range["first"]) + 1
+            last = _WEEKDAY_NAMES.index(named_range["last"]) + 1
+            numeric_item = f"{first}-{last}/{named_range['step']}"
+        match = _CRONTAB_WEEKDAY_ITEM.fullmatch(numeric_item)
+        if named_range is not None and match is None:
+            raise ValueError(f"invalid day_of_week step: {item!r}")
         if match is None or item == "*":
             passthrough.append(item)
         else:

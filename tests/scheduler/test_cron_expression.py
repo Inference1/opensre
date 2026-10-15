@@ -34,6 +34,10 @@ def _fire_days(cron: str) -> set[str]:
         # A step after a name range is ignored by APScheduler, so steps become lists.
         ("1-5/2", {"Mon", "Wed", "Fri"}),
         ("mon-fri", {"Mon", "Tue", "Wed", "Thu", "Fri"}),
+        ("mon-fri/2", {"Mon", "Wed", "Fri"}),
+        ("MON-SUN/2", {"Mon", "Wed", "Fri", "Sun"}),
+        ("tue-fri/2", {"Tue", "Thu"}),
+        ("mon-fri/2,sun", {"Mon", "Wed", "Fri", "Sun"}),
     ],
 )
 def test_a_weekday_field_fires_on_its_crontab_days(day_of_week: str, fires_on: set[str]) -> None:
@@ -61,3 +65,21 @@ def test_the_stored_next_run_skips_the_weekend() -> None:
 
     # Assert: Monday, not Saturday
     assert next_run == "2026-10-12T08:00:00+00:00"
+
+
+@pytest.mark.parametrize("day_of_week", ["mon-fri/0", "mon-fri/-1", "fri-mon/2"])
+def test_invalid_named_weekday_steps_are_rejected(day_of_week: str) -> None:
+    with pytest.raises(ValueError):
+        build_cron_trigger(f"0 9 * * {day_of_week}", "UTC")
+
+
+def test_next_run_honors_a_named_weekday_step() -> None:
+    task = ScheduledTask(
+        kind=TaskKind.MANUAL_LOOP,
+        cron="0 9 * * mon-fri/2",
+        timezone="UTC",
+        provider=Provider.INTERACTIVE_SHELL,
+    )
+    tuesday_before_slot = datetime(2026, 10, 20, 8, 0, tzinfo=UTC)
+
+    assert compute_next_run(task, tuesday_before_slot) == "2026-10-21T09:00:00+00:00"
