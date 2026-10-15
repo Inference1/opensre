@@ -59,6 +59,7 @@ class _Alert:
 
 class _ActiveApp:
     is_running = True
+    is_done = False
 
     def __init__(self, tasks: list[asyncio.Task[None]]) -> None:
         self.loop = asyncio.get_running_loop()
@@ -365,23 +366,37 @@ async def test_busy_terminal_replay_does_not_queue_the_entire_disk_backlog(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("close_failure", [False, True])
 async def test_async_replay_reports_disk_failure_to_the_application_task(
-    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO], close_failure: bool
 ) -> None:
     tasks: list[asyncio.Task[None]] = []
+    close = deferred.DeferredOutput.close
 
     def failing_read(_self: deferred.DeferredOutput) -> Iterator[tuple[bool, str]]:
         raise OSError("disk read failed")
 
-    monkeypatch.setattr(deferred.DeferredOutput, "__iter__", failing_read)
+    def failing_close(captured: deferred.DeferredOutput) -> None:
+        close(captured)
+        raise OSError("disk close failed")
+
+    if close_failure:
+        monkeypatch.setattr(deferred.DeferredOutput, "close", failing_close)
+    else:
+        monkeypatch.setattr(deferred.DeferredOutput, "__iter__", failing_read)
     with _proxy() as (proxy, _output):
         proxy._target_app = cast(Application[str], _ActiveApp(tasks))
         with proxy.defer_output():
             proxy.write("alert\n")
+        with proxy.defer_output():
+            proxy.write("later alert\n")
         proxy.close()
         await asyncio.sleep(0)
-        with pytest.raises(OSError, match="disk read failed"):
+        with pytest.raises(
+            OSError, match="disk close failed" if close_failure else "disk read failed"
+        ):
             await tasks[0]
+        assert proxy._terminal_replay_count == 0
     assert spool_files and all(handle.closed for handle in spool_files)
 
 
@@ -430,9 +445,173 @@ async def test_replay_cancelled_before_its_first_step_still_drains_and_closes(
         proxy._target_app = cast(Application[str], CancelBeforeStartApp(tasks))
         with proxy.defer_output():
             proxy.write("accepted alert\n")
+        with proxy.defer_output():
+            proxy.write("later alert\n")
         proxy.close()
         await asyncio.sleep(0)
         await asyncio.gather(*tasks, return_exceptions=True)
         assert proxy._flush_error is None
-    assert output.text.getvalue() == "accepted alert\n"
+        assert len(tasks) == 1
+    assert output.text.getvalue() == "accepted alert\nlater alert\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+async def test_reverse_cancellation_keeps_multiple_captures_in_fifo_order(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    entered = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def interrupted_terminal(function: Any, *, in_executor: bool) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", interrupted_terminal)
+    with _proxy() as (proxy, output):
+        proxy._target_app = cast(Application[str], _ActiveApp(tasks))
+        with proxy.defer_output():
+            proxy.write("first capture\n")
+            proxy.write("first capture tail\n")
+        with proxy.defer_output():
+            proxy.write("second capture\n")
+        proxy.close()
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.sleep(0)
+        for task in reversed(tasks):
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert proxy._flush_error is None
+    assert output.text.getvalue() == "first capture\nfirst capture tail\nsecond capture\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("app_running", [True, False])
+async def test_later_captures_wait_for_the_same_terminal_worker(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO], app_running: bool
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def slow_terminal(function: Any, *, in_executor: bool) -> None:
+        entered.set()
+        await release.wait()
+        function()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", slow_terminal)
+    with _proxy() as (proxy, output):
+        app = _ActiveApp(tasks)
+        proxy._target_app = cast(Application[str], app)
+        with proxy.defer_output():
+            proxy.write("first capture\n")
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        app.is_running = app_running
+        with proxy.defer_output():
+            proxy.write("second capture\n")
+        proxy.close()
+        await asyncio.sleep(0)
+        assert output.text.getvalue() == ""
+        assert len(tasks) == 1
+        release.set()
+        await asyncio.gather(*tasks)
+        assert proxy._flush_error is None
+    assert output.text.getvalue() == "first capture\nsecond capture\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+async def test_capture_arriving_after_cancellation_joins_the_same_fifo_cleanup(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    entered = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def interrupted_terminal(function: Any, *, in_executor: bool) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", interrupted_terminal)
+    with _proxy() as (proxy, output):
+        proxy._target_app = cast(Application[str], _ActiveApp(tasks))
+        with proxy.defer_output():
+            proxy.write("first capture\n")
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        tasks[0].cancel()
+        with proxy.defer_output():
+            proxy.write("later capture\n")
+        proxy.close()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert len(tasks) == 1
+        assert proxy._flush_error is None
+    assert output.text.getvalue() == "first capture\nlater capture\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+async def test_late_capture_after_app_result_does_not_start_an_unmanaged_task(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    entered = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def immediate_terminal(function: Any, *, in_executor: bool) -> None:
+        function()
+        entered.set()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", immediate_terminal)
+    with _proxy() as (proxy, output):
+        app = _ActiveApp(tasks)
+        proxy._target_app = cast(Application[str], app)
+        with proxy.defer_output():
+            proxy.write("first capture\n")
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.gather(*tasks)
+        # prompt_toolkit keeps is_running true while cancelling background tasks.
+        app.is_done = True
+        with proxy.defer_output():
+            proxy.write("shutdown capture\n")
+        proxy.close()
+        await asyncio.sleep(0)
+        assert len(tasks) == 1
+        assert proxy._flush_error is None
+    assert output.text.getvalue() == "first capture\nshutdown capture\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("app_running", [True, False])
+async def test_plain_output_between_captures_keeps_its_fifo_position(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO], app_running: bool
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def slow_terminal(function: Any, *, in_executor: bool) -> None:
+        entered.set()
+        await release.wait()
+        function()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", slow_terminal)
+    with _proxy() as (proxy, output):
+        app = _ActiveApp(tasks)
+        proxy._target_app = cast(Application[str], app)
+        with proxy.defer_output():
+            proxy.write("capture A\n")
+        if not app_running:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            app.is_running = False
+        # In the running case no enqueue callback has executed yet.
+        proxy.write("plain B\n")
+        with proxy.defer_output():
+            proxy.write("capture C\n")
+        proxy.close()
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert output.text.getvalue() == ""
+        release.set()
+        await asyncio.gather(*tasks)
+        assert proxy._flush_error is None
+    assert output.text.getvalue() == "capture A\nplain B\ncapture C\n"
     assert spool_files and all(handle.closed for handle in spool_files)

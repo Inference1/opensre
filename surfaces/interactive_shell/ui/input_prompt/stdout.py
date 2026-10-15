@@ -6,8 +6,10 @@ import asyncio
 import itertools
 import re
 import sys
-from collections.abc import Iterator
+from collections import deque
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import TextIO, cast
 
 from prompt_toolkit.application import Application, run_in_terminal
@@ -27,6 +29,64 @@ _TRANSIENT_END = "\x00opensre-transient-end\x00"
 _DEFERRED_MARKER = "\x00opensre-deferred-{}\x00"
 _RENDERABLE_MARKER = "\x00opensre-renderable-{}\x00"
 _MARKER = re.compile(r"\x00opensre-(?:transient-(?:start|end)|renderable-(\d+)|deferred-(\d+))\x00")
+
+
+@dataclass
+class _TerminalReplayQueue:
+    """Keep one acknowledged record and ordered disk captures on the app loop."""
+
+    on_close: Callable[[], None]
+    captures: deque[DeferredOutput] = field(default_factory=deque)
+    current: DeferredOutput | None = None
+    records: Iterator[tuple[bool, str]] | None = None
+    pending: str | None = None
+
+    def next_output(self) -> str | None:
+        if self.pending is not None:
+            return self.pending
+        while True:
+            if self.current is None:
+                if not self.captures:
+                    return None
+                self.current = self.captures.popleft()
+                self.records = iter(self.current)
+            assert self.records is not None
+            try:
+                starts_block, text = next(self.records)
+            except StopIteration:
+                self._close_current()
+                continue
+            self.pending = "\r" + text if starts_block else text
+            return self.pending
+
+    def _close_current(self) -> None:
+        captured = self.current
+        self.current = None
+        self.records = None
+        self.pending = None
+        if captured is not None:
+            self._close_capture(captured)
+
+    def _close_capture(self, captured: DeferredOutput) -> None:
+        try:
+            captured.close()
+        finally:
+            self.on_close()
+
+    def close(self) -> None:
+        """Close all captures even when an earlier file cannot be closed."""
+        error: OSError | None = None
+        try:
+            self._close_current()
+        except OSError as exc:
+            error = exc
+        while self.captures:
+            try:
+                self._close_capture(self.captures.popleft())
+            except OSError as exc:
+                error = error or exc
+        if error is not None:
+            raise error
 
 
 class _AppBoundStdoutProxy(StdoutProxy):
@@ -54,6 +114,10 @@ class _AppBoundStdoutProxy(StdoutProxy):
         self._deferred_ids = itertools.count()
         self._flush_error: Exception | None = None
         self._closing = False
+        self._terminal_replays = _TerminalReplayQueue(self._terminal_capture_closed)
+        self._terminal_replay_count = 0
+        self._terminal_replay_loop: asyncio.AbstractEventLoop | None = None
+        self._terminal_replay_task: asyncio.Task[None] | None = None
         self._renderables: dict[int, RenderableType] = {}
         self._renderable_ids = itertools.count()
         # Repaint sooner than the inline default: a full-screen redraw is cheap.
@@ -191,8 +255,9 @@ class _AppBoundStdoutProxy(StdoutProxy):
 
     def _replay_deferred_output(self, loop: asyncio.AbstractEventLoop | None, key: int) -> None:
         captured = self._deferred_files.pop(key)
-        if loop is not None and loop.is_running() and self._transcript is None:
-            self._schedule_terminal_replay(loop, captured)
+        replay_loop = loop or self._terminal_replay_loop
+        if replay_loop is not None and replay_loop.is_running() and self._transcript is None:
+            self._schedule_terminal_replay(replay_loop, captured)
             return
         try:
             transcript = ReplayTranscript()
@@ -219,98 +284,141 @@ class _AppBoundStdoutProxy(StdoutProxy):
     def _schedule_terminal_replay(
         self, loop: asyncio.AbstractEventLoop, captured: DeferredOutput
     ) -> None:
-        records: Iterator[tuple[bool, str]] | None = None
-        pending: str | None = None
-        started = False
+        with self._lock:
+            self._terminal_replay_loop = loop
+            # Count before scheduling: later text must also join the FIFO while
+            # its first enqueue callback has not had a chance to run yet.
+            self._terminal_replay_count += 1
 
-        def record_stream() -> Iterator[tuple[bool, str]]:
-            nonlocal records
-            if records is None:
-                records = iter(captured)
-            return records
+        def enqueue() -> None:
+            self._terminal_replays.captures.append(captured)
+            if self._terminal_replay_task is None:
+                self._start_terminal_replay(loop)
 
-        def write_pending() -> None:
-            nonlocal pending
-            if pending is not None:
-                self._write_to_terminal(None, pending)
-                pending = None
-
-        def drain_remaining() -> None:
-            nonlocal pending
-            write_pending()
-            for starts_block, text in record_stream():
-                pending = "\r" + text if starts_block else text
-                write_pending()
-
-        def close_capture() -> None:
+        try:
+            loop.call_soon_threadsafe(enqueue)
+        except Exception as exc:
+            self._flush_error = exc
             try:
                 captured.close()
-            except OSError as exc:
+            except OSError as close_error:
+                self._flush_error = close_error
+            finally:
+                self._terminal_capture_closed()
+
+    def _terminal_capture_closed(self) -> None:
+        with self._lock:
+            self._terminal_replay_count -= 1
+
+    def _queue_text_behind_terminal_replay(self, text: str) -> bool:
+        with self._lock:
+            if not self._terminal_replay_count:
+                return False
+            loop = self._terminal_replay_loop
+            assert loop is not None
+            captured: DeferredOutput | None = None
+            try:
+                captured = DeferredOutput()
+                captured.write(text)
+            except Exception as exc:
                 self._flush_error = exc
-                raise
+                if captured is not None:
+                    try:
+                        captured.close()
+                    except OSError as close_error:
+                        self._flush_error = close_error
+            else:
+                self._schedule_terminal_replay(loop, captured)
+            return True
+
+    def _write_pending_terminal_record(self) -> None:
+        pending = self._terminal_replays.pending
+        if pending is not None:
+            self._write_to_terminal(None, pending)
+            self._terminal_replays.pending = None
+
+    def _close_terminal_replays(self) -> None:
+        try:
+            self._terminal_replays.close()
+        except OSError as exc:
+            self._flush_error = exc
+            raise
+
+    def _drain_terminal_replays(self) -> None:
+        try:
+            while self._terminal_replays.next_output() is not None:
+                self._write_pending_terminal_record()
+        except Exception as exc:
+            self._flush_error = exc
+            raise
+        finally:
+            self._close_terminal_replays()
+
+    def _start_terminal_replay(self, loop: asyncio.AbstractEventLoop) -> None:
+        if (
+            self._target_app.context is None
+            or not self._target_app.is_running
+            or self._target_app.is_done
+        ):
+            self._drain_terminal_replays()
+            return
+        started = False
 
         async def replay() -> None:
-            nonlocal pending, started
+            nonlocal started
             started = True
             try:
-                # One task owns the disk stream. Read the next record only after
-                # this one has reached the terminal, retaining no task backlog.
+                # One worker owns every capture, including shutdown fallback.
+                # Read another bounded record only after acknowledging this one.
                 async with self._redraw_lock:
-                    for starts_block, text in record_stream():
-                        pending = "\r" + text if starts_block else text
+                    while self._terminal_replays.next_output() is not None:
                         if self._target_app.context is None or not self._target_app.is_running:
-                            write_pending()
+                            self._write_pending_terminal_record()
                             await asyncio.sleep(0)
                         else:
                             with synchronized_output(self._output):
-                                await run_in_terminal(write_pending, in_executor=False)
+                                await run_in_terminal(
+                                    self._write_pending_terminal_record, in_executor=False
+                                )
             except asyncio.CancelledError:
-                # Application shutdown cancels its tasks. Finish on the normal
-                # screen so accepted records do not disappear with the task.
-                try:
-                    drain_remaining()
-                except Exception as exc:
-                    self._flush_error = exc
-                    raise
+                self._drain_terminal_replays()
                 raise
             except Exception as exc:
                 self._flush_error = exc
                 raise
             finally:
-                close_capture()
+                self._close_terminal_replays()
 
-        def finish_unstarted(task: asyncio.Task[None]) -> None:
-            if started:
+        def finished(task: asyncio.Task[None]) -> None:
+            if self._terminal_replay_task is not task:
                 return
-            # A task cancelled before its first step never enters its finally.
             try:
-                drain_remaining()
+                # An unstarted task never enters its finally; captures can also
+                # arrive between cancellation cleanup and this done callback.
+                if not started or task.cancelled():
+                    self._drain_terminal_replays()
             except Exception as exc:
                 self._flush_error = exc
                 loop.call_exception_handler(
                     {"message": "Deferred terminal replay failed", "exception": exc, "task": task}
                 )
             finally:
-                close_capture()
+                self._terminal_replay_task = None
+            if self._terminal_replays.captures:
+                self._start_terminal_replay(loop)
 
-        def start() -> None:
-            context = self._target_app.context
-            if context is not None and self._target_app.is_running:
-                task = context.copy().run(self._target_app.create_background_task, replay())
-            else:
-                task = asyncio.create_task(replay())
-            task.add_done_callback(finish_unstarted)
-
-        try:
-            loop.call_soon_threadsafe(start)
-        except RuntimeError as exc:
-            self._flush_error = exc
-            captured.close()
+        context = self._target_app.context
+        assert context is not None
+        task = context.copy().run(self._target_app.create_background_task, replay())
+        self._terminal_replay_task = task
+        task.add_done_callback(finished)
 
     def _emit_text(
         self, loop: asyncio.AbstractEventLoop | None, text: str, transcript_text: str | None = None
     ) -> None:
         recorded = text if transcript_text is None else transcript_text
+        if self._transcript is None and self._queue_text_behind_terminal_replay(text):
+            return
         if self._transcript is None or self._transient:
             self._write_to_terminal(loop, text)
         elif loop is None:
