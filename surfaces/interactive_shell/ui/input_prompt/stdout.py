@@ -35,7 +35,7 @@ _MARKER = re.compile(r"\x00opensre-(?:transient-(?:start|end)|renderable-(\d+)|d
 class _TerminalReplayQueue:
     """Keep one acknowledged record and ordered disk captures on the app loop."""
 
-    on_close: Callable[[], None]
+    on_close: Callable[[DeferredOutput], None]
     captures: deque[DeferredOutput] = field(default_factory=deque)
     current: DeferredOutput | None = None
     records: Iterator[tuple[bool, str]] | None = None
@@ -68,10 +68,7 @@ class _TerminalReplayQueue:
             self._close_capture(captured)
 
     def _close_capture(self, captured: DeferredOutput) -> None:
-        try:
-            captured.close()
-        finally:
-            self.on_close()
+        self.on_close(captured)
 
     def close(self) -> None:
         """Close all captures even when an earlier file cannot be closed."""
@@ -116,6 +113,7 @@ class _AppBoundStdoutProxy(StdoutProxy):
         self._closing = False
         self._terminal_replays = _TerminalReplayQueue(self._terminal_capture_closed)
         self._terminal_replay_count = 0
+        self._terminal_text_capture: DeferredOutput | None = None
         self._terminal_replay_loop: asyncio.AbstractEventLoop | None = None
         self._terminal_replay_task: asyncio.Task[None] | None = None
         self._renderables: dict[int, RenderableType] = {}
@@ -282,9 +280,11 @@ class _AppBoundStdoutProxy(StdoutProxy):
                 self._flush_error = exc
 
     def _schedule_terminal_replay(
-        self, loop: asyncio.AbstractEventLoop, captured: DeferredOutput
+        self, loop: asyncio.AbstractEventLoop, captured: DeferredOutput, *, ordinary: bool = False
     ) -> None:
         with self._lock:
+            if not ordinary:
+                self._terminal_text_capture = None
             self._terminal_replay_loop = loop
             # Count before scheduling: later text must also join the FIFO while
             # its first enqueue callback has not had a chance to run yet.
@@ -300,15 +300,18 @@ class _AppBoundStdoutProxy(StdoutProxy):
         except Exception as exc:
             self._flush_error = exc
             try:
-                captured.close()
+                self._terminal_capture_closed(captured)
             except OSError as close_error:
                 self._flush_error = close_error
-            finally:
-                self._terminal_capture_closed()
 
-    def _terminal_capture_closed(self) -> None:
+    def _terminal_capture_closed(self, captured: DeferredOutput) -> None:
         with self._lock:
-            self._terminal_replay_count -= 1
+            if self._terminal_text_capture is captured:
+                self._terminal_text_capture = None
+            try:
+                captured.close()
+            finally:
+                self._terminal_replay_count -= 1
 
     def _queue_text_behind_terminal_replay(self, text: str) -> bool:
         with self._lock:
@@ -316,20 +319,29 @@ class _AppBoundStdoutProxy(StdoutProxy):
                 return False
             loop = self._terminal_replay_loop
             assert loop is not None
-            captured: DeferredOutput | None = None
+            captured = self._terminal_text_capture
+            created = captured is None
             try:
-                captured = DeferredOutput()
+                if captured is None:
+                    captured = DeferredOutput()
                 captured.write(text)
             except Exception as exc:
                 self._flush_error = exc
-                if captured is not None:
+                self._terminal_text_capture = None
+                if created and captured is not None:
                     try:
                         captured.close()
                     except OSError as close_error:
                         self._flush_error = close_error
             else:
-                self._schedule_terminal_replay(loop, captured)
+                if created:
+                    self._terminal_text_capture = captured
+                    self._schedule_terminal_replay(loop, captured, ordinary=True)
             return True
+
+    def _next_terminal_output(self) -> str | None:
+        with self._lock:
+            return self._terminal_replays.next_output()
 
     def _write_pending_terminal_record(self) -> None:
         pending = self._terminal_replays.pending
@@ -339,14 +351,15 @@ class _AppBoundStdoutProxy(StdoutProxy):
 
     def _close_terminal_replays(self) -> None:
         try:
-            self._terminal_replays.close()
+            with self._lock:
+                self._terminal_replays.close()
         except OSError as exc:
             self._flush_error = exc
             raise
 
     def _drain_terminal_replays(self) -> None:
         try:
-            while self._terminal_replays.next_output() is not None:
+            while self._next_terminal_output() is not None:
                 self._write_pending_terminal_record()
         except Exception as exc:
             self._flush_error = exc
@@ -371,7 +384,7 @@ class _AppBoundStdoutProxy(StdoutProxy):
                 # One worker owns every capture, including shutdown fallback.
                 # Read another bounded record only after acknowledging this one.
                 async with self._redraw_lock:
-                    while self._terminal_replays.next_output() is not None:
+                    while self._next_terminal_output() is not None:
                         if self._target_app.context is None or not self._target_app.is_running:
                             self._write_pending_terminal_record()
                             await asyncio.sleep(0)

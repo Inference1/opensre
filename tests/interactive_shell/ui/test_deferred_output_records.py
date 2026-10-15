@@ -79,3 +79,31 @@ def test_failed_block_record_keeps_the_accepted_prefix_and_allows_recovery(
         assert list(captured) == [(False, "accepted\n"), (True, "recovered alert\n")]
     finally:
         captured.close()
+
+
+def test_appending_while_reading_preserves_the_unread_prefix_and_new_tail() -> None:
+    captured = DeferredOutput()
+    try:
+        captured.write("first\n")
+        captured.write("second\n")
+        records = iter(captured)
+        assert next(records) == (False, "first\n")
+        captured.write("appended\n")
+        assert list(records) == [(False, "second\n"), (False, "appended\n")]
+    finally:
+        captured.close()
+
+
+def test_interleaved_readers_keep_independent_record_offsets() -> None:
+    captured = DeferredOutput()
+    try:
+        captured.write("first\n")
+        captured.write("second\n")
+        first = iter(captured)
+        second = iter(captured)
+        assert next(first) == (False, "first\n")
+        assert next(second) == (False, "first\n")
+        assert next(first) == (False, "second\n")
+        assert next(second) == (False, "second\n")
+    finally:
+        captured.close()

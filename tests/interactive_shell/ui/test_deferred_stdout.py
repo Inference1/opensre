@@ -7,6 +7,7 @@ import contextvars
 import gc
 import hashlib
 import io
+import threading
 import tracemalloc
 import weakref
 from collections.abc import Iterator
@@ -615,3 +616,220 @@ async def test_plain_output_between_captures_keeps_its_fifo_position(
         assert proxy._flush_error is None
     assert output.text.getvalue() == "capture A\nplain B\ncapture C\n"
     assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+async def test_thousands_of_waiting_plain_flushes_share_one_disk_spool(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def slow_terminal(function: Any, *, in_executor: bool) -> None:
+        entered.set()
+        await release.wait()
+        function()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", slow_terminal)
+    with _proxy() as (proxy, output):
+        app = _ActiveApp(tasks)
+        proxy._target_app = cast(Application[str], app)
+        with proxy.defer_output():
+            proxy.write("capture A\n")
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        try:
+            for index in range(2048):
+                # Exercise separate production flushes without queue batching.
+                proxy._write_and_flush(app.loop, f"plain {index}\n")
+            opened_while_blocked = sum(not handle.closed for handle in spool_files)
+        finally:
+            try:
+                proxy.close()
+            finally:
+                release.set()
+                await asyncio.sleep(0)
+                await asyncio.gather(*tasks)
+    assert opened_while_blocked <= 2
+    assert output.text.getvalue() == "capture A\n" + "".join(
+        f"plain {index}\n" for index in range(2048)
+    )
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+async def test_plain_spool_does_not_extend_past_the_next_form_capture(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def slow_terminal(function: Any, *, in_executor: bool) -> None:
+        entered.set()
+        await release.wait()
+        function()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", slow_terminal)
+    with _proxy() as (proxy, output):
+        app = _ActiveApp(tasks)
+        proxy._target_app = cast(Application[str], app)
+        with proxy.defer_output():
+            proxy.write("capture A\n")
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        proxy._write_and_flush(app.loop, "plain B\n")
+        with proxy.defer_output():
+            proxy.write("capture C\n")
+        proxy.write("plain D\n")
+        proxy.close()
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.gather(*tasks)
+    assert output.text.getvalue() == "capture A\nplain B\ncapture C\nplain D\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+async def test_append_at_plain_spool_eof_is_not_written_to_a_closing_file(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    eof = threading.Event()
+    attempted = threading.Event()
+    appended = threading.Event()
+    errors: list[Exception] = []
+    tasks: list[asyncio.Task[None]] = []
+
+    async def slow_terminal(function: Any, *, in_executor: bool) -> None:
+        entered.set()
+        await release.wait()
+        function()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", slow_terminal)
+    with _proxy() as (proxy, output):
+        app = _ActiveApp(tasks)
+        proxy._target_app = cast(Application[str], app)
+        with proxy.defer_output():
+            proxy.write("capture A\n")
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        proxy._write_and_flush(app.loop, "plain B\n")
+        read = spool_files[1].read
+
+        def observe_eof(size: int) -> bytes:
+            data = read(size)
+            if size == 4 and not data:
+                eof.set()
+                assert attempted.wait(timeout=5)
+                # Let a racing writer try the append while EOF is being closed.
+                appended.wait(timeout=0.1)
+            return data
+
+        def append_at_eof() -> None:
+            try:
+                if not eof.wait(timeout=5):
+                    raise TimeoutError("Reader did not reach EOF")
+                attempted.set()
+                proxy._write_and_flush(app.loop, "late tail\n")
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                appended.set()
+
+        monkeypatch.setattr(spool_files[1], "read", observe_eof)
+        writer = threading.Thread(target=append_at_eof)
+        writer.start()
+        try:
+            release.set()
+            assert await asyncio.to_thread(appended.wait, 5)
+            await asyncio.sleep(0)
+            proxy.close()
+            await asyncio.gather(*tasks)
+        finally:
+            await asyncio.to_thread(writer.join, 5)
+        assert not errors
+        assert proxy._flush_error is None
+    assert output.text.getvalue() == "capture A\nplain B\nlate tail\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+async def test_failed_plain_append_keeps_accepted_records_available_for_replay(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def slow_terminal(function: Any, *, in_executor: bool) -> None:
+        entered.set()
+        await release.wait()
+        function()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", slow_terminal)
+    with _proxy() as (proxy, output):
+        app = _ActiveApp(tasks)
+        proxy._target_app = cast(Application[str], app)
+        with proxy.defer_output():
+            proxy.write("capture A\n")
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        proxy._write_and_flush(app.loop, "accepted B\n")
+
+        def failed_write(_data: bytes) -> int:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(spool_files[1], "write", failed_write)
+        proxy._write_and_flush(app.loop, "unaccepted C\n")
+        assert not spool_files[1].closed
+        try:
+            with pytest.raises(OSError, match="could not be replayed"):
+                proxy.close()
+        finally:
+            release.set()
+            await asyncio.sleep(0)
+            await asyncio.gather(*tasks)
+        assert proxy._terminal_replay_count == 0
+    assert output.text.getvalue() == "capture A\naccepted B\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+async def test_plain_spool_accepts_more_records_while_its_reader_is_waiting(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    entered_a = asyncio.Event()
+    release_a = asyncio.Event()
+    entered_b = asyncio.Event()
+    release_b = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+    calls = 0
+
+    async def paused_terminal(function: Any, *, in_executor: bool) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered_a.set()
+            await release_a.wait()
+        elif calls == 2:
+            entered_b.set()
+            await release_b.wait()
+        function()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", paused_terminal)
+    with _proxy() as (proxy, output):
+        app = _ActiveApp(tasks)
+        proxy._target_app = cast(Application[str], app)
+        with proxy.defer_output():
+            proxy.write("capture A\n")
+        await asyncio.wait_for(entered_a.wait(), timeout=5)
+        proxy._write_and_flush(app.loop, "plain first\n")
+        proxy._write_and_flush(app.loop, "plain unread\n")
+        release_a.set()
+        await asyncio.wait_for(entered_b.wait(), timeout=5)
+        proxy._write_and_flush(app.loop, "plain appended\n")
+        proxy.close()
+        release_b.set()
+        await asyncio.gather(*tasks)
+    assert output.text.getvalue() == "capture A\nplain first\nplain unread\nplain appended\n"
+    assert len(spool_files) == 2
+    assert all(handle.closed for handle in spool_files)

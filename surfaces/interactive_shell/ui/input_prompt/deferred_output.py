@@ -6,6 +6,7 @@ import struct
 import tempfile
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from os import SEEK_END
 from typing import BinaryIO, cast
 
 from config.constants.terminal_host import DEFERRED_OUTPUT_CHUNK_CHARS
@@ -37,7 +38,7 @@ class DeferredOutput:
             self._write_record(payload, block=block and start == 0)
 
     def _write_record(self, payload: bytes, *, block: bool) -> None:
-        position = self._file.tell()
+        position = self._file.seek(0, SEEK_END)
         try:
             self._write_all(struct.pack("!I", len(payload) | (_BLOCK_RECORD if block else 0)))
             self._write_all(payload)
@@ -56,8 +57,12 @@ class DeferredOutput:
             remaining = remaining[written:]
 
     def __iter__(self) -> Iterator[tuple[bool, str]]:
-        self._file.seek(0)
-        while header := self._file.read(4):
+        position = 0
+        while True:
+            self._file.seek(position)
+            header = self._file.read(4)
+            if not header:
+                return
             if len(header) != 4:
                 raise OSError("Invalid deferred output record")
             framed_size = struct.unpack("!I", header)[0]
@@ -67,6 +72,7 @@ class DeferredOutput:
             payload = self._file.read(size)
             if len(payload) != size:
                 raise OSError("Incomplete deferred output record")
+            position = self._file.tell()
             yield bool(framed_size & _BLOCK_RECORD), payload.decode("utf-8", errors="surrogatepass")
 
     def close(self) -> None:
