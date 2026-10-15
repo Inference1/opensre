@@ -14,6 +14,8 @@ from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.patch_stdout import StdoutProxy
 from rich.console import RenderableType
 
+from surfaces.interactive_shell.ui.input_prompt.deferred_output import DeferredOutput
+from surfaces.interactive_shell.ui.input_prompt.replay_transcript import ReplayTranscript
 from surfaces.interactive_shell.ui.input_prompt.synchronized import synchronized_output
 from surfaces.interactive_shell.ui.transcript_view import TranscriptStore, render_text
 
@@ -22,10 +24,9 @@ from surfaces.interactive_shell.ui.transcript_view import TranscriptStore, rende
 # ``write`` strips NUL from captured output, so no output can spell a marker.
 _TRANSIENT_START = "\x00opensre-transient-start\x00"
 _TRANSIENT_END = "\x00opensre-transient-end\x00"
-_DEFERRED_START = "\x00opensre-deferred-start\x00"
-_DEFERRED_END = "\x00opensre-deferred-end\x00"
+_DEFERRED_MARKER = "\x00opensre-deferred-{}\x00"
 _RENDERABLE_MARKER = "\x00opensre-renderable-{}\x00"
-_MARKER = re.compile(r"\x00opensre-(?:(?:transient|deferred)-(?:start|end)|renderable-(\d+))\x00")
+_MARKER = re.compile(r"\x00opensre-(?:transient-(?:start|end)|renderable-(\d+)|deferred-(\d+))\x00")
 
 
 class _AppBoundStdoutProxy(StdoutProxy):
@@ -45,10 +46,14 @@ class _AppBoundStdoutProxy(StdoutProxy):
         self._target_app = app
         self._redraw_lock = asyncio.Lock()
         self._transcript = transcript
-        # Read and written only by the flush thread.
+        # Transient state is owned by the flush thread; capture state uses _lock.
         self._transient = False
         self._deferred_depth = 0
-        self._deferred_output: list[str] = []
+        self._deferred_output: DeferredOutput | None = None
+        self._deferred_files: dict[int, DeferredOutput] = {}
+        self._deferred_ids = itertools.count()
+        self._flush_error: Exception | None = None
+        self._closing = False
         self._renderables: dict[int, RenderableType] = {}
         self._renderable_ids = itertools.count()
         # Repaint sooner than the inline default: a full-screen redraw is cheap.
@@ -56,10 +61,15 @@ class _AppBoundStdoutProxy(StdoutProxy):
 
     def write(self, data: str) -> int:
         """Queue ``data``; NUL is dropped so output cannot forge a marker."""
-        if "\x00" in data:
-            super().write(data.replace("\x00", ""))
-            return len(data)
-        return super().write(data)
+        with self._lock:
+            self._ensure_open()
+            self._raise_flush_error()
+            text = data.replace("\x00", "")
+            if self._deferred_output is not None:
+                self._deferred_output.write(text)
+            else:
+                super().write(text)
+        return len(data)
 
     def write_renderable(self, renderable: RenderableType) -> bool:
         """Queue a Rich renderable so the transcript can lay it out at any width.
@@ -68,9 +78,19 @@ class _AppBoundStdoutProxy(StdoutProxy):
         """
         if self._transcript is None:
             return False
-        key = next(self._renderable_ids)
-        self._renderables[key] = renderable
-        self._queue_marker(_RENDERABLE_MARKER.format(key))
+        with self._lock:
+            self._ensure_open()
+            self._raise_flush_error()
+            if self._deferred_output is not None:
+                # Snapshot only deferred renderables so the aggregate backlog
+                # never retains live objects; normal output still reflows.
+                self._deferred_output.write(
+                    render_text(renderable, self._output.get_size().columns)
+                )
+            else:
+                key = next(self._renderable_ids)
+                self._renderables[key] = renderable
+                self._queue_marker(_RENDERABLE_MARKER.format(key))
         return True
 
     def begin_transient_output(self) -> None:
@@ -83,12 +103,61 @@ class _AppBoundStdoutProxy(StdoutProxy):
 
     @contextmanager
     def defer_output(self) -> Iterator[None]:
-        """Hold background output until a temporary full-screen surface closes."""
-        self._queue_marker(_DEFERRED_START)
+        """Capture output on disk until the outermost full-screen form closes."""
+        with self._lock:
+            self._ensure_open()
+            self._raise_flush_error()
+            if not self._deferred_depth:
+                captured = DeferredOutput()
+                self._flush()
+                self._deferred_output = captured
+            self._deferred_depth += 1
         try:
             yield
         finally:
-            self._queue_marker(_DEFERRED_END)
+            with self._lock:
+                self._deferred_depth -= 1
+                if not self._deferred_depth:
+                    self._seal_deferred_output()
+
+    def _seal_deferred_output(self) -> None:
+        captured = self._deferred_output
+        if captured is not None:
+            self._deferred_output = None
+            key = next(self._deferred_ids)
+            self._deferred_files[key] = captured
+            self._queue_marker(_DEFERRED_MARKER.format(key))
+
+    def close(self) -> None:
+        if not self.closed:
+            with self._lock:
+                self._closing = True
+                self._seal_deferred_output()
+                self._flush()
+            try:
+                super().close()
+            finally:
+                for captured in self._deferred_files.values():
+                    captured.close()
+                self._deferred_files.clear()
+        self._raise_flush_error()
+
+    def __exit__(self, *args: object) -> None:
+        try:
+            self.close()
+        except OSError as error:
+            original = args[1] if len(args) > 1 else None
+            if not isinstance(original, BaseException):
+                raise
+            original.add_note(str(error))
+
+    def _raise_flush_error(self) -> None:
+        if self._flush_error is not None:
+            raise OSError("Deferred output could not be replayed") from self._flush_error
+
+    def _ensure_open(self) -> None:
+        if self.closed or self._closing:
+            raise ValueError("I/O operation on closed stdout proxy")
 
     def _queue_marker(self, marker: str) -> None:
         # One lock hold: no other writer's text can land between the flush of
@@ -108,33 +177,47 @@ class _AppBoundStdoutProxy(StdoutProxy):
         text: str,
     ) -> None:
         for segment in _split_markers(text):
-            if segment == _DEFERRED_START:
-                self._deferred_depth += 1
-            elif segment == _DEFERRED_END:
-                self._deferred_depth -= 1
-                if not self._deferred_depth:
-                    pending = "".join(self._deferred_output)
-                    self._deferred_output.clear()
-                    self._write_and_flush(loop, pending)
+            match = _MARKER.fullmatch(segment)
+            if match is not None and match.group(2) is not None:
+                self._replay_deferred_output(loop, int(match.group(2)))
             elif segment == _TRANSIENT_START:
                 self._transient = True
             elif segment == _TRANSIENT_END:
                 self._transient = False
-            elif self._deferred_depth:
-                self._deferred_output.append(segment)
-            elif self._transcript is None:
-                self._write_to_terminal(loop, segment)
-            elif (match := _MARKER.fullmatch(segment)) is not None:
+            elif match is not None:
                 self._flush_renderable(loop, self._renderables.pop(int(match.group(1))))
-            elif self._transient:
-                self._write_to_terminal(loop, segment)
-            elif loop is None:
-                # The full-screen app is off screen (startup, a picker): the
-                # text lands in scrollback now and joins the transcript too.
-                self._write_to_terminal(None, segment)
-                self._transcript.append_text(segment, on_normal_screen=True)
             else:
-                self._transcript.append_text(segment)
+                self._emit_text(loop, segment)
+
+    def _replay_deferred_output(self, loop: asyncio.AbstractEventLoop | None, key: int) -> None:
+        captured = self._deferred_files.pop(key)
+        try:
+            transcript = ReplayTranscript()
+            for text in captured:
+                self._emit_text(loop, text, transcript.feed(text))
+            if final := transcript.finish():
+                self._emit_text(loop, "", final)
+        except Exception as exc:
+            self._flush_error = exc
+        finally:
+            try:
+                captured.close()
+            except OSError as exc:
+                self._flush_error = exc
+
+    def _emit_text(
+        self, loop: asyncio.AbstractEventLoop | None, text: str, transcript_text: str | None = None
+    ) -> None:
+        recorded = text if transcript_text is None else transcript_text
+        if self._transcript is None or self._transient:
+            self._write_to_terminal(loop, text)
+        elif loop is None:
+            # The full-screen app is off screen (startup, a picker): the
+            # text lands in scrollback now and joins the transcript too.
+            self._write_to_terminal(None, text)
+            self._transcript.append_text(recorded, on_normal_screen=True)
+        else:
+            self._transcript.append_text(recorded)
 
     def _flush_renderable(
         self, loop: asyncio.AbstractEventLoop | None, renderable: RenderableType

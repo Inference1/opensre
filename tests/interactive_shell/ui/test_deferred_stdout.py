@@ -1,0 +1,306 @@
+"""Deferred output stays off-screen without retaining the whole backlog in RAM."""
+
+from __future__ import annotations
+
+import asyncio
+import gc
+import hashlib
+import io
+import tracemalloc
+import weakref
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import BinaryIO, cast
+
+import pytest
+from prompt_toolkit.application import Application, create_app_session
+from prompt_toolkit.input import DummyInput
+from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.output.base import Size
+from rich.text import Text
+
+import surfaces.interactive_shell.ui.input_prompt.deferred_output as deferred
+from surfaces.interactive_shell.ui.input_prompt.stdout import _AppBoundStdoutProxy
+from surfaces.interactive_shell.ui.transcript_view import TranscriptStore
+
+
+class _Output(DummyOutput):
+    def __init__(self) -> None:
+        self.bytes_written = 0
+        self.digest = hashlib.sha256()
+        self.largest_write = 0
+        self.text = io.StringIO()
+        self.retain_text = True
+
+    def write(self, data: str) -> None:
+        self.write_raw(data)
+
+    def write_raw(self, data: str) -> None:
+        encoded = data.encode("utf-8")
+        self.digest.update(encoded)
+        self.bytes_written += len(encoded)
+        self.largest_write = max(self.largest_write, len(data))
+        if self.retain_text:
+            self.text.write(data)
+
+    def get_size(self) -> Size:
+        return Size(rows=24, columns=80)
+
+
+class _Alert:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __rich__(self) -> Text:
+        return Text(self.text)
+
+
+@contextmanager
+def _proxy(store: TranscriptStore | None = None) -> Iterator[tuple[_AppBoundStdoutProxy, _Output]]:
+    output = _Output()
+    with create_app_session(input=DummyInput(), output=output):
+        app = Application[str](input=DummyInput(), output=output)
+        proxy = _AppBoundStdoutProxy(app, raw=True, transcript=store)
+        try:
+            yield proxy, output
+        finally:
+            if not proxy.closed:
+                proxy.close()
+
+
+def test_long_form_capture_stays_bounded_and_replays_in_small_writes() -> None:
+    expected = hashlib.sha256()
+    with _proxy() as (proxy, output):
+        output.retain_text = False
+        with proxy.defer_output():
+            tracemalloc.start()
+            try:
+                for index in range(4096):
+                    # No newline: neither the proxy's line buffer nor its queue may accumulate it.
+                    chunk = f"{index:08d}" + "x" * 4088
+                    expected.update(chunk.encode())
+                    proxy.write(chunk)
+                gc.collect()
+                retained, _peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            assert output.bytes_written == 0
+            assert retained < 2 * 1024 * 1024
+        proxy.close()
+
+    assert output.bytes_written == 16 * 1024 * 1024
+    assert output.digest.digest() == expected.digest()
+    assert output.largest_write <= 64 * 1024
+
+
+def test_deferred_rich_objects_are_released_before_the_form_closes() -> None:
+    store = TranscriptStore()
+    with _proxy(store) as (proxy, output), proxy.defer_output():
+        references: list[weakref.ReferenceType[_Alert]] = []
+        for index in range(128):
+            item = _Alert(f"alert {index}")
+            references.append(weakref.ref(item))
+            assert proxy.write_renderable(item)
+        del item
+        gc.collect()
+        assert all(reference() is None for reference in references)
+        assert output.bytes_written == 0
+
+    text = output.text.getvalue()
+    assert text.index("alert 0") < text.index("alert 127")
+    rows, _older = store.tail_rows(80, 256)
+    assert any("alert 127" in "".join(part for _style, part in row) for row in rows)
+
+
+def test_nested_forms_preserve_text_and_rich_order() -> None:
+    store = TranscriptStore()
+    with _proxy(store) as (proxy, output):
+        proxy.write("before\n")
+        with proxy.defer_output():
+            proxy.write("outer\n")
+            with proxy.defer_output():
+                assert proxy.write_renderable(Text("inner alert"))
+            proxy.write("last\n")
+        proxy.write("after\n")
+        proxy.close()
+
+    text = output.text.getvalue()
+    positions = [text.index(value) for value in ("before", "outer", "inner alert", "last", "after")]
+    assert positions == sorted(positions)
+    rows, _older = store.tail_rows(80, 20)
+    transcript = "\n".join("".join(part for _style, part in row) for row in rows)
+    assert "inner alert" in transcript
+
+
+def test_form_exception_still_releases_accepted_output() -> None:
+    with _proxy() as (proxy, output):
+        with pytest.raises(RuntimeError, match="form failed"), proxy.defer_output():
+            proxy.write("accepted alert\n")
+            raise RuntimeError("form failed")
+        proxy.close()
+    assert output.text.getvalue() == "accepted alert\n"
+
+
+def test_close_inside_a_form_flushes_once_and_outer_exit_is_safe() -> None:
+    with _proxy() as (proxy, output):
+        with proxy.defer_output():
+            proxy.write("accepted without newline")
+            proxy.close()
+        proxy.close()
+    assert output.text.getvalue() == "accepted without newline"
+
+
+def test_deferred_output_cannot_forge_internal_markers() -> None:
+    with _proxy() as (proxy, output), proxy.defer_output():
+        proxy.write("\x00opensre-deferred-123\x00\n")
+    assert output.text.getvalue() == "opensre-deferred-123\n"
+
+
+def test_partial_disk_write_preserves_the_previously_accepted_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = deferred.DeferredOutput()
+    captured.write("accepted alert\n")
+    write = captured._file.write
+    calls = 0
+
+    def failing_write(data: bytes) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            write(data[:2])
+            raise OSError("disk full")
+        return write(data)
+
+    try:
+        monkeypatch.setattr(captured._file, "write", failing_write)
+        with pytest.raises(OSError, match="disk full"):
+            captured.write("unaccepted output")
+        assert list(captured) == ["accepted alert\n"]
+    finally:
+        captured.close()
+
+
+@pytest.fixture
+def spool_files(monkeypatch: pytest.MonkeyPatch) -> list[BinaryIO]:
+    opened: list[BinaryIO] = []
+    create = deferred.tempfile.TemporaryFile
+
+    def tracked_file(*, mode: str, buffering: int = -1) -> BinaryIO:
+        handle = cast(BinaryIO, create(mode=mode, buffering=buffering))
+        opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(deferred.tempfile, "TemporaryFile", tracked_file)
+    return opened
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_aborted_forms_close_their_disk_spool(spool_files: list[BinaryIO], cancel: bool) -> None:
+    error = asyncio.CancelledError if cancel else RuntimeError
+    with _proxy() as (proxy, output):
+        with pytest.raises(error), proxy.defer_output():
+            proxy.write("accepted alert\n")
+            raise error()
+        proxy.close()
+    assert output.text.getvalue() == "accepted alert\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+def test_replay_errors_are_reported_and_do_not_leak_files(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    def failing_read(_self: deferred.DeferredOutput) -> Iterator[str]:
+        raise OSError("disk read failed")
+
+    monkeypatch.setattr(deferred.DeferredOutput, "__iter__", failing_read)
+    with _proxy() as (proxy, _output):
+        with proxy.defer_output():
+            proxy.write("alert\n")
+        with pytest.raises(OSError, match="could not be replayed"):
+            proxy.close()
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+def test_replay_failure_does_not_hide_the_original_form_exception(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO]
+) -> None:
+    def failing_read(_self: deferred.DeferredOutput) -> Iterator[str]:
+        raise OSError("disk read failed")
+
+    monkeypatch.setattr(deferred.DeferredOutput, "__iter__", failing_read)
+    with (
+        _proxy() as (proxy, _output),
+        pytest.raises(RuntimeError, match="form failed") as caught,
+        proxy,
+        proxy.defer_output(),
+    ):
+        proxy.write("alert\n")
+        raise RuntimeError("form failed")
+    assert any("could not be replayed" in note for note in caught.value.__notes__)
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected"),
+    [
+        (["prefix\x1b[", "31mALERT\x1b[0m\n"], "prefixALERT"),
+        (["kept\r", "\n"], "kept"),
+        (["kept\x1b]8;;https://example.test", "\x1b", "\\ALERT\n"], "keptALERT"),
+        (["obsolete\n\x1b[", "2Jfresh\n"], "fresh"),
+    ],
+    ids=["split-sgr", "split-crlf", "split-osc", "split-clear"],
+)
+def test_replay_preserves_terminal_sequences_across_capture_records(
+    chunks: list[str], expected: str
+) -> None:
+    store = TranscriptStore()
+    with _proxy(store) as (proxy, output), proxy.defer_output():
+        for chunk in chunks:
+            proxy.write(chunk)
+    assert output.text.getvalue() == "".join(chunks)
+    rows, _older = store.tail_rows(80, 20)
+    assert "\n".join("".join(text for _style, text in row) for row in rows) == expected
+
+
+def test_replay_carries_colour_to_the_next_record_and_honours_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    store = TranscriptStore()
+    with _proxy(store) as (proxy, _output), proxy.defer_output():
+        proxy.write("\x1b[31mfirst\n")
+        proxy.write("second\n")
+        proxy.write("\x1b[0mplain\n")
+    rows, _older = store.tail_rows(80, 20)
+    coloured = ["".join(text for style, text in row if "red" in style) for row in rows]
+    assert coloured == ["first", "second", ""]
+
+
+def test_closed_proxy_rejects_output_instead_of_accepting_an_unread_queue() -> None:
+    with _proxy() as (proxy, output):
+        proxy.close()
+        with pytest.raises(ValueError, match="closed"):
+            proxy.write("lost alert")
+    assert output.bytes_written == 0
+
+
+@pytest.mark.parametrize(
+    ("chunks", "red_rows"),
+    [
+        (["\x1b[31mfirst\npartial", "tail\n"], ["first", "partialtail"]),
+        (["\x1b[31mfirst\npartial", "\x1b[0mtail\n"], ["first", "partial"]),
+        (["\x1b[31mold\rpartial", "tail\n"], ["partialtail"]),
+    ],
+    ids=["newline-carry", "newline-reset", "carriage-return"],
+)
+def test_partial_lines_keep_the_style_active_at_their_start(
+    monkeypatch: pytest.MonkeyPatch, chunks: list[str], red_rows: list[str]
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    store = TranscriptStore()
+    with _proxy(store) as (proxy, _output), proxy.defer_output():
+        for chunk in chunks:
+            proxy.write(chunk)
+    rows, _older = store.tail_rows(80, 20)
+    assert ["".join(text for style, text in row if "red" in style) for row in rows] == red_rows
