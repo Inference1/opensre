@@ -8,7 +8,6 @@ import re
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from functools import partial
 from typing import TextIO, cast
 
 from prompt_toolkit.application import Application, run_in_terminal
@@ -220,37 +219,87 @@ class _AppBoundStdoutProxy(StdoutProxy):
     def _schedule_terminal_replay(
         self, loop: asyncio.AbstractEventLoop, captured: DeferredOutput
     ) -> None:
+        records: Iterator[tuple[bool, str]] | None = None
+        pending: str | None = None
+        started = False
+
+        def record_stream() -> Iterator[tuple[bool, str]]:
+            nonlocal records
+            if records is None:
+                records = iter(captured)
+            return records
+
+        def write_pending() -> None:
+            nonlocal pending
+            if pending is not None:
+                self._write_to_terminal(None, pending)
+                pending = None
+
+        def drain_remaining() -> None:
+            nonlocal pending
+            write_pending()
+            for starts_block, text in record_stream():
+                pending = "\r" + text if starts_block else text
+                write_pending()
+
+        def close_capture() -> None:
+            try:
+                captured.close()
+            except OSError as exc:
+                self._flush_error = exc
+                raise
+
         async def replay() -> None:
+            nonlocal pending, started
+            started = True
             try:
                 # One task owns the disk stream. Read the next record only after
                 # this one has reached the terminal, retaining no task backlog.
                 async with self._redraw_lock:
-                    for starts_block, text in captured:
-                        output = "\r" + text if starts_block else text
+                    for starts_block, text in record_stream():
+                        pending = "\r" + text if starts_block else text
                         if self._target_app.context is None or not self._target_app.is_running:
-                            self._write_to_terminal(None, output)
+                            write_pending()
                             await asyncio.sleep(0)
                         else:
                             with synchronized_output(self._output):
-                                await run_in_terminal(
-                                    partial(self._write_to_terminal, None, output),
-                                    in_executor=False,
-                                )
+                                await run_in_terminal(write_pending, in_executor=False)
             except asyncio.CancelledError:
-                self._flush_error = OSError("Deferred terminal replay was cancelled")
+                # Application shutdown cancels its tasks. Finish on the normal
+                # screen so accepted records do not disappear with the task.
+                try:
+                    drain_remaining()
+                except Exception as exc:
+                    self._flush_error = exc
+                    raise
                 raise
             except Exception as exc:
                 self._flush_error = exc
                 raise
             finally:
-                captured.close()
+                close_capture()
+
+        def finish_unstarted(task: asyncio.Task[None]) -> None:
+            if started:
+                return
+            # A task cancelled before its first step never enters its finally.
+            try:
+                drain_remaining()
+            except Exception as exc:
+                self._flush_error = exc
+                loop.call_exception_handler(
+                    {"message": "Deferred terminal replay failed", "exception": exc, "task": task}
+                )
+            finally:
+                close_capture()
 
         def start() -> None:
             context = self._target_app.context
             if context is not None and self._target_app.is_running:
-                context.copy().run(self._target_app.create_background_task, replay())
+                task = context.copy().run(self._target_app.create_background_task, replay())
             else:
-                asyncio.create_task(replay())
+                task = asyncio.create_task(replay())
+            task.add_done_callback(finish_unstarted)
 
         try:
             loop.call_soon_threadsafe(start)

@@ -383,3 +383,56 @@ async def test_async_replay_reports_disk_failure_to_the_application_task(
         with pytest.raises(OSError, match="disk read failed"):
             await tasks[0]
     assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_written", [False, True])
+async def test_cancelled_terminal_replay_drains_each_accepted_record_once(
+    monkeypatch: pytest.MonkeyPatch, spool_files: list[BinaryIO], current_written: bool
+) -> None:
+    entered = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def interrupted_terminal(function: Any, *, in_executor: bool) -> None:
+        if current_written:
+            function()
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(stdout_module, "run_in_terminal", interrupted_terminal)
+    with _proxy() as (proxy, output):
+        proxy._target_app = cast(Application[str], _ActiveApp(tasks))
+        with proxy.defer_output():
+            proxy.write("first alert\n")
+            proxy.write("second alert\n")
+        proxy.close()
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        tasks[0].cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert proxy._flush_error is None
+    assert output.text.getvalue() == "first alert\nsecond alert\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
+
+
+@pytest.mark.asyncio
+async def test_replay_cancelled_before_its_first_step_still_drains_and_closes(
+    spool_files: list[BinaryIO],
+) -> None:
+    tasks: list[asyncio.Task[None]] = []
+
+    class CancelBeforeStartApp(_ActiveApp):
+        def create_background_task(self, coroutine: Any) -> asyncio.Task[None]:
+            task = super().create_background_task(coroutine)
+            task.cancel()
+            return task
+
+    with _proxy() as (proxy, output):
+        proxy._target_app = cast(Application[str], CancelBeforeStartApp(tasks))
+        with proxy.defer_output():
+            proxy.write("accepted alert\n")
+        proxy.close()
+        await asyncio.sleep(0)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert proxy._flush_error is None
+    assert output.text.getvalue() == "accepted alert\n"
+    assert spool_files and all(handle.closed for handle in spool_files)
